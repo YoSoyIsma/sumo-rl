@@ -36,7 +36,7 @@ class SumoEnvironment(MultiAgentEnv):
     """
 
     def __init__(self, net_file, route_file, phases, out_csv_name=None, use_gui=False, num_seconds=20000, max_depart_delay=100000,
-                 time_to_load_vehicles=0, delta_time=5, min_green=5, max_green=50, single_agent=False):
+                 time_to_load_vehicles=0, delta_time=5, min_green=5, max_green=50, single_agent=False ,type_of_reward=2):
 
         self._net = net_file
         self._route = route_file
@@ -48,12 +48,15 @@ class SumoEnvironment(MultiAgentEnv):
 
         traci.start([sumolib.checkBinary('sumo'), '-n', self._net])  # start only to retrieve information
 
+        self.type_of_reward  = type_of_reward
         self.single_agent = single_agent
         self.ts_ids = traci.trafficlight.getIDList()
         self.lanes_per_ts = len(set(traci.trafficlight.getControlledLanes(self.ts_ids[0])))
         self.traffic_signals = dict()
+        ''' verify '''
         self.phases = phases
         self.num_green_phases = len(phases) // 2  # Number of green phases == number of phases (green+yellow) divided by 2
+
         self.vehicles = dict()
         self.last_measure = dict()  # used to reward function remember last measure
         self.last_reward = {i: 0 for i in self.ts_ids}
@@ -63,7 +66,7 @@ class SumoEnvironment(MultiAgentEnv):
         self.max_depart_delay = max_depart_delay  # Max wait time to insert a vehicle
         self.min_green = min_green
         self.max_green = max_green
-        self.yellow_time = 2
+        self.yellow_time = 3
 
         """
         Default observation space is a vector R^(#greenPhases + 1 + 2 * #lanes)
@@ -88,7 +91,7 @@ class SumoEnvironment(MultiAgentEnv):
         self.out_csv_name = out_csv_name
 
         traci.close()
-        
+
     def reset(self):
         if self.run != 0:
             self.save_csv(self.out_csv_name, self.run)
@@ -98,15 +101,21 @@ class SumoEnvironment(MultiAgentEnv):
         sumo_cmd = [self._sumo_binary,
                      '-n', self._net,
                      '-r', self._route,
-                     '--max-depart-delay', str(self.max_depart_delay), 
-                     '--waiting-time-memory', '10000', 
+                     '--max-depart-delay', str(self.max_depart_delay),
+                     '--waiting-time-memory', '10000',
                      '--random']
         if self.use_gui:
             sumo_cmd.append('--start')
         traci.start(sumo_cmd)
 
+        # for ts in self.ts_ids:
+        #     self.traffic_signals[ts] = TrafficSignal(self, ts, self.delta_time, self.min_green, self.max_green, self.phases)
+        #     self.last_measure[ts] = 0.0
         for ts in self.ts_ids:
-            self.traffic_signals[ts] = TrafficSignal(self, ts, self.delta_time, self.min_green, self.max_green, self.phases)
+            # self.traffic_signals[ts] = TrafficSignal(self, ts, self.delta_time, self.min_green, self.max_green, self.phases)
+            duration_time = self.getDurationTimes(ts)
+            pha = self.CPhase(duration_time)
+            self.traffic_signals[ts] = TrafficSignal(self, ts, self.delta_time, self.min_green, self.max_green, pha)
             self.last_measure[ts] = 0.0
 
         self.vehicles = dict()
@@ -130,9 +139,9 @@ class SumoEnvironment(MultiAgentEnv):
     def step(self, actions):
         # act
         self._apply_actions(actions)
-   
+
         # run simulation for delta time
-        for _ in range(self.yellow_time): 
+        for _ in range(self.yellow_time):
             self._sumo_step()
         for ts in self.ts_ids:
             self.traffic_signals[ts].update_phase()
@@ -148,16 +157,16 @@ class SumoEnvironment(MultiAgentEnv):
         self.last_reward = reward
 
         if self.single_agent:
-            return observation[self.ts_ids[0]], reward[self.ts_ids[0]], done['__all__'], {}
+            return observation[self.ts_ids[0]], reward[self.ts_ids[0]], done['__all__'], info
         else:
-            return observation, reward, done, {}
+            return observation, reward, done, info
 
     def _apply_actions(self, actions):
         """
         Set the next green phase for the traffic signals
         :param actions: If single-agent, actions is an int between 0 and self.num_green_phases (next green phase)
                         If multiagent, actions is a dict {ts_id : greenPhase}
-        """   
+        """
         if self.single_agent:
             self.traffic_signals[self.ts_ids[0]].set_next_phase(actions)
         else:
@@ -178,24 +187,32 @@ class SumoEnvironment(MultiAgentEnv):
         return observations
 
     def _compute_rewards(self):
-        return self._waiting_time_reward()
-        #return self._queue_reward()
-        #return self._waiting_time_reward2()
-        #return self._queue_average_reward()
+        ''' Seleeciona el tipo de recompensa, o si solo se considera un tipo o varias.
+            Reward 1: Suma el tiempo de espera de cada lane entrante y restala lectura actual con la lectura pasada
+            Reward 2: Esta recompensa esta parametrizada para ser entre 0 y 1
+            Reward 3: Esta recompensa esta en negativo para tener un reward negativo
+            Reward 4: Hace un promedio de la cantidad de vehiculos que estuvieron esperando
+            reward 5: hace un estimado de todos los carros que estuvieron detenidos
 
-    def _queue_average_reward(self):
-        rewards = {}
-        for ts in self.ts_ids:
-            new_average = np.mean(self.traffic_signals[ts].get_stopped_vehicles_num())
-            rewards[ts] = self.last_measure[ts] - new_average
-            self.last_measure[ts] = new_average
-        return rewards
+        '''
+        # return self._waiting_time_reward3()
+        if self.type_of_reward == 1:
+            return self._waiting_time_reward()
+        elif self.type_of_reward == 2:
+            return self._waiting_time_reward2()
+        elif self.type_of_reward == 3:
+            return self._waiting_time_reward3()
+        elif self.type_of_reward == 4:
+            return self._queue_average_reward()
+        elif self.type_of_reward == 5:
+            return self._queue_reward()
 
-    def _queue_reward(self):
-        rewards = {}
-        for ts in self.ts_ids:
-            rewards[ts] = - (sum(self.traffic_signals[ts].get_stopped_vehicles_num()))**2
-        return rewards
+
+    # def _compute_rewards(self):
+    #     return self._waiting_time_reward()
+    #     #return self._queue_reward()
+    #     #return self._waiting_time_reward2()
+    #     #return self._queue_average_reward()
 
     def _waiting_time_reward(self):
         rewards = {}
@@ -224,6 +241,20 @@ class SumoEnvironment(MultiAgentEnv):
             self.last_measure[ts] = ts_wait
         return rewards
 
+    def _queue_average_reward(self):
+        rewards = {}
+        for ts in self.ts_ids:
+            new_average = np.mean(self.traffic_signals[ts].get_stopped_vehicles_num())
+            rewards[ts] = self.last_measure[ts] - new_average
+            self.last_measure[ts] = new_average
+        return rewards
+
+    def _queue_reward(self):
+        rewards = {}
+        for ts in self.ts_ids:
+            rewards[ts] = - (sum(self.traffic_signals[ts].get_stopped_vehicles_num()))**2
+        return rewards
+
     def _sumo_step(self):
         traci.simulationStep()
 
@@ -239,10 +270,20 @@ class SumoEnvironment(MultiAgentEnv):
     def close(self):
         traci.close()
 
-    def encode(self, state):
-        phase = state[:self.num_green_phases].index(1)
+    # def encode(self, state):
+    #     phase = state[:self.num_green_phases].index(1)
+    #     elapsed = self._discretize_elapsed_time(state[self.num_green_phases])
+    #     density_queue = [self._discretize_density(d) for d in state[ int(self.num_green_phases +1):]]
+    #
+    #     # density_queue = [self._discretize_density(d) for d in state[self.num_green_phases + 1:]]
+    #     return self.radix_encode([phase, elapsed] + density_queue)
+    def encode(self,state):
+        if sum(state[:self.num_green_phases]) > 0:
+            phase = state[:self.num_green_phases].index(1)
+        else:
+            phase = 0
         elapsed = self._discretize_elapsed_time(state[self.num_green_phases])
-        density_queue = [self._discretize_density(d) for d in state[self.num_green_phases + 1:]]
+        density_queue = [self._discretize_density(d) for d in state[self.num_green_phases:]]
         return self.radix_encode([phase, elapsed] + density_queue)
 
     def _discretize_density(self, density):
@@ -291,3 +332,53 @@ class SumoEnvironment(MultiAgentEnv):
         if out_csv_name is not None:
             df = pd.DataFrame(self.metrics)
             df.to_csv(out_csv_name + '_run{}'.format(run) + '.csv', index=False)
+
+    def getDurationTimes(self, TLS_ID):
+        '''
+        Input (str):   ID para optener todas las fases del tiempo.
+        Output (List): Regresa una lista con el tiempo de las fases y sus states del TLS
+                         en orden de ejecucion. [42.0, 'GGrr', 3.0, 'yyrr']
+        '''
+
+        b = str(traci.trafficlight.getCompleteRedYellowGreenDefinition(TLS_ID))
+        #b = str(traci.trafficlight.getCompleteRedYellowGreenDefinition('0'))
+        a = list(b.split())
+        duration = []
+        i = 0
+        while i < len(a):
+            if ('duration' in a[i]) == True:
+                r = (a[i].split("duration")[1]).rstrip(',').lstrip('=')
+                duration.append(float(r))
+            if ('state' in a[i]) == True:
+                j = (a[i]).split("state")[1].strip(',').strip('=').strip("'").strip("'")
+                duration.append(j)
+            i = i + 1
+
+        return  duration
+
+    def CPhase(self, duration_state):
+        '''
+        Efectua el cambio de tiempo del TLS con los nuevos tiempos
+        Inputs: ID del TLS a cambiar[str], lista con tiempos de duraccion y de estados [List]
+        Output: lista del logic (solo como referencias futuras)
+
+        Ejemplo:
+        Input: (TLS_ID = '0', duration_state = [42.0, 'GGrr', 3.0, 'yyrr', 42.00, 'rrGG',3.0, 'rrGG'])
+        Output:
+            r = Logic(programID='0', type=0, currentPhaseIndex=0,
+                phases=[Phase(duration=42.0, state='GGrr', minDur=42.0, maxDur=42.0, next=-1),
+                        Phase(duration=3.0, state='yyrr', minDur=3.0, maxDur=3.0, next=-1),
+                        Phase(duration=42.0, state='rrGG', minDur=42.0, maxDur=42.0, next=-1),
+                        Phase(duration=3.0, state='rrGG', minDur=3.0, maxDur=3.0, next=-1)], subParameter={})
+
+        '''
+        t = []
+        i = 0
+        d_s = duration_state
+        while i < len(d_s):
+            x = d_s[i]
+            state = d_s[(i + 1)]
+            t_i = traci.trafficlight.Phase(x,state,x,x)
+            t.append(t_i)
+            i = i + 2
+        return t
